@@ -1,0 +1,19 @@
+{
+  "name": "tricknet-video-pipeline",
+  "version": "1.0.0",
+  "description": "Servidor de geracao automatizada de videos verticais para o TrickNet News",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "axios": "^1.7.7",
+    "@andresaya/edge-tts": "^1.8.0"
+  }
+}
