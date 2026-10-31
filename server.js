@@ -6,7 +6,6 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { EdgeTTS } = require('@andresaya/edge-tts');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -261,24 +260,130 @@ function mapearCortesParaSegundos(textoLimpo, cortes, boundariesSeg) {
   return resultado;
 }
 
+// (31/10/2026) NARRAÇÃO TROCADA: a biblioteca @andresaya/edge-tts passou a
+// receber "Unexpected server response: 403" em todas as tentativas (todos
+// os vídeos falhavam na etapa [narracao]). A narração agora usa o pacote
+// msedge-tts, o mesmo método do servidor do TrickNet News, que gera a voz
+// sem esse erro. As funções abaixo (escaparXml, escolherFormatoSaida,
+// converterMetadataMsEdge e gerarNarracao) foram adaptadas dele.
+// O resto do código não muda: gerarNarracao devolve o mesmo formato
+// { caminhoAudio, boundaries } que o restante do arquivo já espera.
+
+// O msedge-tts monta o SSML por dentro e a documentação dele recomenda
+// escapar o texto de entrada. Sem isso, um "&" ou "<" numa matéria
+// quebra o pedido de voz.
+function escaparXml(texto) {
+  return String(texto)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Não fixa o nome do formato MP3 no código: procura o primeiro formato
+// MP3 24kHz mono disponível na lib. Se não achar nenhum MP3, usa o
+// formato WebM/Opus (o ffmpeg lê normalmente).
+function escolherFormatoSaida(OUTPUT_FORMAT) {
+  const chaves = Object.keys(OUTPUT_FORMAT).filter((k) => isNaN(Number(k)));
+  const mp3 =
+    chaves.find((k) => /MP3/.test(k) && /24KHZ/.test(k) && /MONO/.test(k)) ||
+    chaves.find((k) => /MP3/.test(k));
+  const chave = mp3 || 'WEBM_24KHZ_16BIT_MONO_OPUS';
+  return { chave, valor: OUTPUT_FORMAT[chave] };
+}
+
+// Converte o arquivo de metadata do msedge-tts para o formato que o
+// normalizarBoundaries() já entende ({ text, offset, duration }).
+// A unidade de Offset/Duration é detectada comparando com a duração real
+// do áudio, e tudo é convertido para "ticks" de 100 ns (a unidade padrão
+// do Edge) - assim o normalizarBoundaries() escolhe o divisor 10000000.
+function converterMetadataMsEdge(metadataJson, duracaoAudioSeg) {
+  const lista = Array.isArray(metadataJson)
+    ? metadataJson
+    : (metadataJson && metadataJson.Metadata) || [];
+
+  const palavras = [];
+  for (const item of lista) {
+    if (!item) continue;
+    const d = item.Data || {};
+    const tipo = item.Type || (d.text && d.text.BoundaryType);
+    if (tipo !== 'WordBoundary') continue;
+    const texto = (d.text && d.text.Text) || d.Text || '';
+    palavras.push({
+      texto: String(texto),
+      offset: Number(d.Offset) || 0,
+      duration: Number(d.Duration) || 0,
+    });
+  }
+  if (palavras.length === 0) return [];
+
+  const maiorFim = Math.max(...palavras.map((p) => p.offset + p.duration));
+  const razao = duracaoAudioSeg > 0 ? maiorFim / duracaoAudioSeg : 0;
+
+  // razao ~1 => segundos | ~1000 => milissegundos | ~10000000 => ticks
+  let fator = 1;
+  if (razao > 0 && razao < 50) fator = 10000000;
+  else if (razao >= 50 && razao < 500000) fator = 10000;
+
+  // IMPORTANTE: o campo da palavra tem que se chamar "text" - é o nome que o
+  // normalizarBoundaries() procura (text/Text/word/Word). Com outro nome
+  // as palavras chegam vazias e a legenda e os cortes quebram.
+  return palavras.map((p) => ({
+    text: p.texto,
+    offset: p.offset * fator,
+    duration: p.duration * fator,
+  }));
+}
+
 async function gerarNarracao(texto, idioma, caminhoSaidaSemExtensao, vozForcada, tentativas = 2) {
   const voz = vozForcada || VOZES_POR_IDIOMA[idioma] || VOZES_POR_IDIOMA[IDIOMA_PADRAO];
 
   for (let tentativa = 1; tentativa <= tentativas; tentativa++) {
+    // Pasta própria por tentativa: a lib grava o arquivo dentro de uma
+    // pasta, e várias narrações do mesmo job usam a mesma pasta temporária
+    // (audio, gancho-corte-N, abertura-longo-audio) - assim uma não
+    // sobrescreve a outra.
+    const pastaTts = `${caminhoSaidaSemExtensao}-tts-${tentativa}`;
+    let tts = null;
     try {
-      const tts = new EdgeTTS();
-      await tts.synthesize(texto, voz, {
-        rate: '+0%',
-        volume: '+0%',
-        pitch: '+0Hz',
-      });
-      const caminhoFinal = await tts.toFile(caminhoSaidaSemExtensao);
-      let boundaries = [];
-      try {
-        boundaries = await tts.getWordBoundaries();
-      } catch (e) {
-        boundaries = [];
+      const modulo = await import('msedge-tts');
+      const MsEdgeTTS = modulo.MsEdgeTTS || (modulo.default && modulo.default.MsEdgeTTS);
+      const OUTPUT_FORMAT = modulo.OUTPUT_FORMAT || (modulo.default && modulo.default.OUTPUT_FORMAT);
+      if (!MsEdgeTTS || !OUTPUT_FORMAT) {
+        throw new Error('Nao foi possivel carregar MsEdgeTTS/OUTPUT_FORMAT do pacote msedge-tts.');
       }
+
+      const formato = escolherFormatoSaida(OUTPUT_FORMAT);
+      fs.mkdirSync(pastaTts, { recursive: true });
+
+      tts = new MsEdgeTTS();
+      await tts.setMetadata(voz, formato.valor, { wordBoundaryEnabled: true });
+      const resultado = await tts.toFile(pastaTts, escaparXml(texto));
+
+      if (!resultado || !resultado.audioFilePath || !fs.existsSync(resultado.audioFilePath)) {
+        throw new Error('msedge-tts nao devolveu o arquivo de audio.');
+      }
+      const ext = path.extname(resultado.audioFilePath) || '.mp3';
+      const caminhoFinal = caminhoSaidaSemExtensao + ext;
+      fs.copyFileSync(resultado.audioFilePath, caminhoFinal);
+      if (fs.statSync(caminhoFinal).size === 0) {
+        throw new Error('msedge-tts gerou um arquivo de audio vazio.');
+      }
+
+      let boundaries = [];
+      if (resultado.metadataFilePath && fs.existsSync(resultado.metadataFilePath)) {
+        try {
+          const metadataJson = JSON.parse(fs.readFileSync(resultado.metadataFilePath, 'utf8'));
+          const duracaoAudioSeg = await obterDuracaoAudio(caminhoFinal);
+          boundaries = converterMetadataMsEdge(metadataJson, duracaoAudioSeg);
+        } catch (e) {
+          console.log(`[narracao] Nao foi possivel ler o tempo por palavra (${e.message || e}) - legenda/cortes podem falhar neste video.`);
+          boundaries = [];
+        }
+      }
+
+      console.log(`[narracao] msedge-tts OK (voz ${voz}, formato ${formato.chave}, ${boundaries.length} palavras com tempo).`);
       return { caminhoAudio: caminhoFinal, boundaries };
     } catch (erro) {
       const ultimaTentativa = tentativa === tentativas;
@@ -287,6 +392,9 @@ async function gerarNarracao(texto, idioma, caminhoSaidaSemExtensao, vozForcada,
         throw erro;
       }
       await esperar(5000);
+    } finally {
+      try { if (tts && typeof tts.close === 'function') tts.close(); } catch (e) { /* ignora */ }
+      try { fs.rmSync(pastaTts, { recursive: true, force: true }); } catch (e) { /* ignora */ }
     }
   }
 }
